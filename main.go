@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,7 +19,7 @@ import (
 	"golang.org/x/sys/windows/svc/debug"
 )
 
-var logger daplogger.Logger
+var logger daplogger.Logger = initLogging()
 
 type ParsedCommands []string
 
@@ -40,27 +43,68 @@ type Script struct {
 }
 
 func (s *Script) ParseCommand(command string) {
-	split := strings.Split(command, " ")
-	for i, v := range split {
-		if i == 0 {
-			s.name = v
-		} else {
-			s.args = append(s.args, v)
+	var parts []string
+	var current strings.Builder
+	inQuotes := false
+
+	// Iterate over each character in the command
+	for i := 0; i < len(command); i++ {
+		c := command[i]
+
+		switch c {
+		case '|':
+			// Toggle the inQuotes flag when encountering a single quote
+			inQuotes = !inQuotes
+			if len(parts) != 0 {
+			}
+		case ' ':
+			// If inside quotes, continue accumulating the argument
+			if inQuotes {
+				current.WriteByte(c)
+			} else if current.Len() > 0 {
+				// If we encounter a space and we're outside of quotes, finalize the current argument
+				parts = append(parts, current.String())
+				current.Reset()
+			}
+		default:
+			// Otherwise, accumulate the character in the current argument
+			current.WriteByte(c)
 		}
+	}
+
+	// Add last part if needed
+	if current.Len() > 0 {
+		parts = append(parts, current.String())
+	}
+
+	// First argument is the command
+	if len(parts) > 0 {
+		s.name = parts[0]
+		s.args = parts[1:]
 	}
 }
 
 func (s *Script) spawnProcess() {
 	s.ctx, s.cancel = context.WithCancel(context.Background()) // Create and store the context
 	cmd := exec.CommandContext(s.ctx, s.name, s.args...)
+	exePath, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	cmd.Dir = filepath.Dir(exePath)
+
 	fmt.Println("Spawning with context:", cmd.Path, cmd.Args)
 	s.cmd = cmd
 	s.errorChan = make(chan bool, 1)
 	s.successChan = make(chan bool, 1)
 
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
 	go func() {
 		if err := cmd.Start(); err != nil {
 			fmt.Println("Error starting:", err)
+			logger.LogError(err.Error())
 			s.errorChan <- true
 			return
 		}
@@ -85,6 +129,10 @@ func (s *Script) spawnProcess() {
 		default:
 			// Context was not cancelled, process finished normally
 			if err != nil {
+				if stderr.Len() > 0 {
+					logger.LogError(stderr.String())
+				}
+				logger.LogError(err.Error())
 				fmt.Println("Process exited with error:", err)
 				s.errorChan <- true
 			} else {
@@ -186,7 +234,7 @@ func runService(service WindowsService, isService bool) {
 
 // ? ***************** functions related to flags
 func installService(exePath, name, description, args string) {
-	fullCmd := fmt.Sprintf(`"%s" %s --name="%s"`, exePath, args, name)
+	fullCmd := fmt.Sprintf(`"%s" %s`, exePath, args)
 	fmt.Println("Full Command: ", fullCmd)
 	installCmd := fmt.Sprintf(
 		`New-Service -Name "%s" -BinaryPathName '%s' -StartupType Automatic -Description "%s"`,
@@ -234,7 +282,35 @@ func stopService(serviceName string) {
 	fmt.Println(string(output))
 }
 
-//? ***************** functions related to flags
+func initLogging() daplogger.Logger {
+	var cwd string
+
+	isServce, err := svc.IsWindowsService()
+	if err != nil {
+		log.Fatal("Error determining service status")
+	}
+
+	if isServce {
+		exePath, err := os.Executable()
+		if err != nil {
+			log.Fatalf("Failed to get executable path: %v", err)
+		}
+
+		cwd = filepath.Dir(exePath)
+	} else {
+		dir, err := os.Getwd()
+		if err != nil {
+			log.Fatal("Failed to get the working directory")
+		}
+		cwd = dir
+	}
+
+	logDir := path.Join(cwd, "ErrorLogs")
+
+	logger := daplogger.CreateLogger(logDir, "ErrorLogs", 21)
+
+	return logger
+}
 
 func main() {
 	install := flag.Bool("install", false, "Install the service")
@@ -255,9 +331,10 @@ func main() {
 		script := Script{}
 		script.ParseCommand(v)
 		scripts = append(scripts, script)
+		fmt.Println("Script:", script)
 	}
-	fmt.Println(commands)
-	fmt.Println(scripts)
+	// fmt.Println(commands)
+	// fmt.Println(scripts)
 
 	exePath, err := os.Executable()
 	if err != nil {
@@ -267,10 +344,10 @@ func main() {
 	if *install {
 		installParams := ""
 		for _, v := range commands {
-			installParams += fmt.Sprintf(`--command=\"%s\" `, v)
+			installParams += fmt.Sprintf(`--command="%s" `, v)
 		}
 		fmt.Println(installParams)
-		installService(exePath, *name, *desc, installParams)
+		installService(exePath, *name, *desc, strings.TrimSpace(installParams))
 		return
 	}
 
