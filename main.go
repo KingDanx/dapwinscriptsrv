@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/KingDanx/daplogger"
@@ -32,6 +33,7 @@ type Script struct {
 	name        string
 	args        []string
 	cmd         *exec.Cmd
+	ctx         context.Context // Store the context
 	cancel      context.CancelFunc
 	errorChan   chan bool
 	successChan chan bool
@@ -39,38 +41,57 @@ type Script struct {
 
 func (s *Script) ParseCommand(command string) {
 	split := strings.Split(command, " ")
-
 	for i, v := range split {
 		if i == 0 {
 			s.name = v
 		} else {
 			s.args = append(s.args, v)
 		}
-
 	}
-
 }
 
 func (s *Script) spawnProcess() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	cmd := exec.CommandContext(ctx, s.name, s.args...)
-	fmt.Println(cmd.Args)
-	s.cancel = cancel
+	s.ctx, s.cancel = context.WithCancel(context.Background()) // Create and store the context
+	cmd := exec.CommandContext(s.ctx, s.name, s.args...)
+	fmt.Println("Spawning with context:", cmd.Path, cmd.Args)
 	s.cmd = cmd
 	s.errorChan = make(chan bool, 1)
 	s.successChan = make(chan bool, 1)
-	if err := cmd.Start(); err != nil {
-		s.errorChan <- true
-		return
-	}
 
-	if err := cmd.Wait(); err != nil {
-		fmt.Println(err)
-		s.errorChan <- true
-	} else {
-		s.successChan <- true
-	}
+	go func() {
+		if err := cmd.Start(); err != nil {
+			fmt.Println("Error starting:", err)
+			s.errorChan <- true
+			return
+		}
+
+		// Wait for either the process to finish or the context to be cancelled
+		err := cmd.Wait()
+
+		select {
+		case <-s.ctx.Done():
+			fmt.Printf("[%s] Context cancelled, attempting to kill process...\n", s.name)
+			if s.cmd.Process != nil {
+				killErr := s.cmd.Process.Kill()
+				if killErr != nil {
+					fmt.Println("Error killing process due to context cancellation:", killErr)
+				} else {
+					fmt.Println("Process killed due to context cancellation.")
+				}
+			}
+			if err == nil || s.ctx.Err() == context.Canceled {
+				s.errorChan <- true // Signal an error (cancellation)
+			}
+		default:
+			// Context was not cancelled, process finished normally
+			if err != nil {
+				fmt.Println("Process exited with error:", err)
+				s.errorChan <- true
+			} else {
+				s.successChan <- true
+			}
+		}
+	}()
 }
 
 func (s *Script) run() {
@@ -83,8 +104,12 @@ func (s *Script) run() {
 			fmt.Printf("[%s] Script exited normally, not retrying\n", s.name)
 			return
 		case <-s.errorChan:
-			fmt.Printf("[%s] Script failed, retrying in 5s...\n", s.name)
+			fmt.Printf("[%s] Script failed or cancelled, retrying in 5s...\n", s.name)
 			time.Sleep(5 * time.Second)
+		}
+		if s.ctx.Err() == context.Canceled {
+			fmt.Printf("[%s] Run loop exiting due to context cancellation.\n", s.name)
+			return
 		}
 	}
 }
@@ -92,13 +117,14 @@ func (s *Script) run() {
 type WindowsService struct {
 	name    string
 	scripts []Script
+	mu      sync.Mutex
 }
 
 func (m *WindowsService) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- svc.Status) (svcSpecificEC bool, exitCode uint32) {
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
 	s <- svc.Status{State: svc.StartPending}
 
-	go m.startApp()
+	m.startApp()
 
 	//? Immediately report the service as running
 	s <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
@@ -111,6 +137,15 @@ loop:
 			case svc.Interrogate:
 				s <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
+				fmt.Println("Stopping service, cancelling contexts...")
+				for _, script := range m.scripts {
+					if script.cancel != nil {
+						fmt.Printf("Cancelling context for script: %s\n", script.name)
+						script.cancel() // Now this should not be nil (most of the time)
+					} else {
+						fmt.Printf("Cancel function is nil for script: %s\n", script.name)
+					}
+				}
 				s <- svc.Status{State: svc.StopPending}
 				break loop
 			default:
@@ -124,15 +159,12 @@ loop:
 }
 
 func (m *WindowsService) startApp() {
-	for _, script := range m.scripts {
-		go script.run()
-	}
-	select {}
-}
-
-func (m *WindowsService) stopApp() {
-	for _, script := range m.scripts {
-		script.cmd.Process.Kill()
+	for i := range m.scripts {
+		// Create context and cancel function *here*
+		ctx, cancel := context.WithCancel(context.Background())
+		m.scripts[i].ctx = ctx
+		m.scripts[i].cancel = cancel
+		go m.scripts[i].run()
 	}
 }
 
@@ -154,7 +186,7 @@ func runService(service WindowsService, isService bool) {
 
 // ? ***************** functions related to flags
 func installService(exePath, name, description, args string) {
-	fullCmd := fmt.Sprintf(`%s %s --name="%s"`, exePath, args, name) // Removed the single quotes around %s for name
+	fullCmd := fmt.Sprintf(`"%s" %s --name="%s"`, exePath, args, name)
 	fmt.Println("Full Command: ", fullCmd)
 	installCmd := fmt.Sprintf(
 		`New-Service -Name "%s" -BinaryPathName '%s' -StartupType Automatic -Description "%s"`,
@@ -179,31 +211,26 @@ func uninstallService(serviceName string) {
 	}
 
 	fmt.Println(string(output))
-
 	fmt.Println("Service uninstalled successfully.")
 }
 
 func startService(serviceName string) {
 	startCmd := fmt.Sprintf(`Start-Service -Name "%s"`, serviceName)
-
 	cmd := exec.Command("powershell", "-Command", startCmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Fatalf("Failed to start service: %v. Output: %s", err, output)
 	}
-
 	fmt.Println(string(output))
 }
 
 func stopService(serviceName string) {
 	startCmd := fmt.Sprintf(`Stop-Service -Name "%s"`, serviceName)
-
 	cmd := exec.Command("powershell", "-Command", startCmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Fatalf("Failed to stop service: %v. Output: %s", err, output)
 	}
-
 	fmt.Println(string(output))
 }
 
@@ -240,7 +267,7 @@ func main() {
 	if *install {
 		installParams := ""
 		for _, v := range commands {
-			installParams += fmt.Sprintf(`--command="%s" `, v)
+			installParams += fmt.Sprintf(`--command=\"%s\" `, v)
 		}
 		fmt.Println(installParams)
 		installService(exePath, *name, *desc, installParams)
@@ -270,6 +297,7 @@ func main() {
 	service := WindowsService{
 		name:    *name,
 		scripts: scripts,
+		mu:      sync.Mutex{},
 	}
 
 	runService(service, isService)
