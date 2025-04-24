@@ -1,0 +1,4 @@
+github.com/KingDanx/daplogger v0.0.0-20240814150243-7afd5680c983 h1:1kJJIg5wwnCzgbHkTlSLBVNVE7nNRWBdQUFq5vZaPFE=
+github.com/KingDanx/daplogger v0.0.0-20240814150243-7afd5680c983/go.mod h1:iry0SdB6TiNBusdK29tLvVIb0Bc04ummm3CowTmrC2M=
+golang.org/x/sys v0.32.0 h1:s77OFDvIQeibCmezSnk/q6iAfkdiQaJi4VzroCFrN20=
+golang.org/x/sys v0.32.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
