@@ -1,4 +1,6 @@
-module dapwinscriptsrv
+module github.com/KingDanx/dapwinscriptsrv
+
+replace github.com/KingDanx/dapwinscriptsrv => .
 
 go 1.24.0
 

@@ -13,7 +13,7 @@ import (
 	"sync"
 
 	"github.com/KingDanx/daplogger"
-	_ "github.com/KingDanx/dapwinscriptsrv/script"
+	"github.com/KingDanx/dapwinscriptsrv/script"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
 )
@@ -33,7 +33,7 @@ func (pc *ParsedCommands) Set(value string) error {
 
 type WindowsService struct {
 	name    string
-	scripts []Script
+	scripts []script.Script
 	mu      sync.Mutex
 }
 
@@ -55,12 +55,12 @@ loop:
 				s <- c.CurrentStatus
 			case svc.Stop, svc.Shutdown:
 				fmt.Println("Stopping service, cancelling contexts...")
-				for _, script := range m.scripts {
-					if script.cancel != nil {
-						fmt.Printf("Cancelling context for script: %s\n", script.name)
-						script.cancel() // Now this should not be nil (most of the time)
+				for _, s := range m.scripts {
+					if s.Cancel != nil {
+						fmt.Printf("Cancelling context for script: %s\n", s.Name)
+						s.Cancel() // Now this should not be nil (most of the time)
 					} else {
-						fmt.Printf("Cancel function is nil for script: %s\n", script.name)
+						fmt.Printf("Cancel function is nil for script: %s\n", s.Name)
 					}
 				}
 				s <- svc.Status{State: svc.StopPending}
@@ -79,9 +79,9 @@ func (m *WindowsService) startApp() {
 	for i := range m.scripts {
 		// Create context and cancel function *here*
 		ctx, cancel := context.WithCancel(context.Background())
-		m.scripts[i].ctx = ctx
-		m.scripts[i].cancel = cancel
-		go m.scripts[i].run()
+		m.scripts[i].Ctx = ctx
+		m.scripts[i].Cancel = cancel
+		go m.scripts[i].Run()
 	}
 }
 
@@ -194,10 +194,10 @@ func main() {
 
 	flag.Parse()
 
-	var scripts []Script
+	var scripts []script.Script
 
 	for _, v := range commands {
-		script := Script{}
+		script := script.Script{}
 		script.ParseCommand(v)
 		scripts = append(scripts, script)
 		fmt.Println("Script:", script)
