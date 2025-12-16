@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -12,9 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/KingDanx/daplogger"
+	_ "github.com/KingDanx/dapwinscriptsrv/script"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
 )
@@ -30,136 +29,6 @@ func (pc *ParsedCommands) String() string {
 func (pc *ParsedCommands) Set(value string) error {
 	*pc = append(*pc, value)
 	return nil
-}
-
-type Script struct {
-	name        string
-	args        []string
-	cmd         *exec.Cmd
-	ctx         context.Context // Store the context
-	cancel      context.CancelFunc
-	errorChan   chan bool
-	successChan chan bool
-}
-
-func (s *Script) ParseCommand(command string) {
-	var parts []string
-	var current strings.Builder
-	inQuotes := false
-
-	// Iterate over each character in the command
-	for i := 0; i < len(command); i++ {
-		c := command[i]
-
-		switch c {
-		case '|':
-			// Toggle the inQuotes flag when encountering a single quote
-			inQuotes = !inQuotes
-			if len(parts) != 0 {
-			}
-		case ' ':
-			// If inside quotes, continue accumulating the argument
-			if inQuotes {
-				current.WriteByte(c)
-			} else if current.Len() > 0 {
-				// If we encounter a space and we're outside of quotes, finalize the current argument
-				parts = append(parts, current.String())
-				current.Reset()
-			}
-		default:
-			// Otherwise, accumulate the character in the current argument
-			current.WriteByte(c)
-		}
-	}
-
-	// Add last part if needed
-	if current.Len() > 0 {
-		parts = append(parts, current.String())
-	}
-
-	// First argument is the command
-	if len(parts) > 0 {
-		s.name = parts[0]
-		s.args = parts[1:]
-	}
-}
-
-func (s *Script) spawnProcess() {
-	s.ctx, s.cancel = context.WithCancel(context.Background()) // Create and store the context
-	cmd := exec.CommandContext(s.ctx, s.name, s.args...)
-	exePath, err := os.Executable()
-	if err != nil {
-		panic(err)
-	}
-	cmd.Dir = filepath.Dir(exePath)
-
-	fmt.Println("Spawning with context:", cmd.Path, cmd.Args)
-	s.cmd = cmd
-	s.errorChan = make(chan bool, 1)
-	s.successChan = make(chan bool, 1)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	go func() {
-		if err := cmd.Start(); err != nil {
-			fmt.Println("Error starting:", err)
-			logger.LogError(err.Error())
-			s.errorChan <- true
-			return
-		}
-
-		// Wait for either the process to finish or the context to be cancelled
-		err := cmd.Wait()
-
-		select {
-		case <-s.ctx.Done():
-			fmt.Printf("[%s] Context cancelled, attempting to kill process...\n", s.name)
-			if s.cmd.Process != nil {
-				killErr := s.cmd.Process.Kill()
-				if killErr != nil {
-					fmt.Println("Error killing process due to context cancellation:", killErr)
-				} else {
-					fmt.Println("Process killed due to context cancellation.")
-				}
-			}
-			if err == nil || s.ctx.Err() == context.Canceled {
-				s.errorChan <- true // Signal an error (cancellation)
-			}
-		default:
-			// Context was not cancelled, process finished normally
-			if err != nil {
-				if stderr.Len() > 0 {
-					logger.LogError(stderr.String())
-				}
-				logger.LogError(err.Error())
-				fmt.Println("Process exited with error:", err)
-				s.errorChan <- true
-			} else {
-				s.successChan <- true
-			}
-		}
-	}()
-}
-
-func (s *Script) run() {
-	for {
-		fmt.Printf("[%s] Starting script: %s %v\n", s.name, s.name, s.args)
-		s.spawnProcess()
-
-		select {
-		case <-s.successChan:
-			fmt.Printf("[%s] Script exited normally, not retrying\n", s.name)
-			return
-		case <-s.errorChan:
-			fmt.Printf("[%s] Script failed or cancelled, retrying in 5s...\n", s.name)
-			time.Sleep(5 * time.Second)
-		}
-		if s.ctx.Err() == context.Canceled {
-			fmt.Printf("[%s] Run loop exiting due to context cancellation.\n", s.name)
-			return
-		}
-	}
 }
 
 type WindowsService struct {

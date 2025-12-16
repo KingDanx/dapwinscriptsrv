@@ -1,8 +1,8 @@
-module github.com/KingDanx/dapwinscriptsrv
+module dapwinscriptsrv
 
-go 1.24.2
+go 1.24.0
 
 require (
 	github.com/KingDanx/daplogger v0.0.0-20240814150243-7afd5680c983
-	golang.org/x/sys v0.32.0
+	golang.org/x/sys v0.39.0
 )
